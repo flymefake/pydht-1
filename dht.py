@@ -1,3 +1,5 @@
+import blist
+import bencode
 import weakref
 import zope.interface
 
@@ -14,6 +16,10 @@ class DHTNode(object):
         self._ip = ip
         self._port = port
 
+    @property
+    def node_id(self):
+        return self._id
+
     def distance(self, other):
         return self._id
 
@@ -22,15 +28,25 @@ class DHTNode(object):
 class DHTBucket(object)
     MAX_ITEMS = 8
     def __init__(self):
-        self._items = blist.sortedlist(key=lambda 
+        self._items = blist.sortedlist(key=lambda item: item.node_id)
 
-class DHTBucketList(object):
-    pass
+    def add_node(self, node):
+        pass
+
+
+class DHTBucketTree(object):
+    """
+    """
+    def __init__(self):
+        self._min = 0
+        self._max = 2**160
+        self.children = list()
 
 
 class DHTRouter(object):
     def __init__(self, port):
         self._observers = weakref.WeakSet()
+        self._buckers = DHTBucketTree()
 
     def add_observer(self, observer_obj):
         if not IDHTObserver.providedBy(observer_obj):
