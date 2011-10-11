@@ -38,6 +38,7 @@ class DHTBucketNode(object):
 
     This class should be Thread-safe
     """
+    # TODO: fix datastructure, this tree is degenerate
     # Within this class, an `item' is a DHTNode and a `node' is part of the tree
     MAX_ITEMS = 8
 
@@ -95,6 +96,9 @@ class DHTBucketNode(object):
             raise Exception("Programmer Error")
 
     def add_item(self, item):
+        """
+        Lock-protected add item
+        """
         if not self.accepts_item(item):
             raise Exception("Unacceptable item")
         with self._mut_lock:
@@ -115,10 +119,26 @@ class DHTBucketNode(object):
             raise Exception("Programmer Error")
 
     def find_item(self, item_id):
+        """
+        Lock-protected find item
+        """
         if not self.accepts_id(item_id):
             return False
         with self._mut_lock:
             return self.__find_item(item_id)
+
+    def all_items(self):
+        """
+        In-order iterable of all items in the tree
+        """
+        if self.is_interior_node():
+            for ch in self._children:
+                for i in ch.all_items():
+                    yield i
+        elif self.is_leaf_node():
+            with self._mut_lock:
+                for i in self._items:
+                    yield i
 
     def __repr__(self):
         if self.is_interior_node():
