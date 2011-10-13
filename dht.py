@@ -10,6 +10,9 @@ class IDHTObserver(zope.interface.Interface):
     def someevent(foo):
         pass
 
+class DHTNodeID(object):
+    pass
+
 
 class DHTNode(object):
     def __init__(self, node_id, ip, port):
@@ -27,6 +30,9 @@ class DHTNode(object):
     @property
     def address(self):
         return (self._ip, self._port)
+
+    def to_bin(self):
+        return ("%040x" % self._id).decode('hex')
 
     def __repr__(self):
         return "<DHTNode 0x%040x %s:%d>" % (self._id, self._ip, self._port)
@@ -153,16 +159,64 @@ class DHTBucketNode(object):
             raise Exception("Programmer Error")
 
 
+class TokenGenerator(object):
+    pass
+
+
 class DHTRouter(object):
     def __init__(self, port):
         self._observers = weakref.WeakSet()
         self._buckets = DHTBucketTree()
+        self._handlers = dict()
 
     def add_observer(self, observer_obj):
         if not IDHTObserver.providedBy(observer_obj):
             raise TypeError("add_observer argument must implement interface IDHTObserver")
         self._observers.add(observer_obj)
 
-    def add_handler(self, handler_func):
-        pass
+    def add_handler(self, **key_req):
+        def decorator(handler_func):
+            self._handlers[handler_name] = handler_func
+            return handler_func
+
+
+dht_router = DHTRouter(6881)
+
+@dht_router.add_handler(q='ping', y='q')
+def ping_handler(router, ping_message):
+    assert 't' in ping_message, "Malformed ping message"
+    return {'t': ping_message['t'], 'y': 'r', 'r': {'id': router.node_id.to_bin()}}
+
+@dht_router.add_handler(q='ping', y='r')
+def ping_handler(router, ping_message):
+    assert 'id' in ping_message['r'], "Malformed ping message"
+    router.bump_node(ping_message['r']['id'])
+
+@dht_router.add_handler(q='find_node', y='q')
+def find_node_handler(router, find_node_message):
+    assert 'id' in find_node_message['a']
+    assert 'target' in find_node_message['a']
+    nodes = ''
+    return {'t': find_node_message['t'], 'y': 'r', 'r': {'id': router.node_id.to_bin(), 'nodes': nodes}}
+
+@dht_router.add_handler(q='find_node', y='r')
+def find_node_handler(router, find_node_message):
+    pass
+
+@dht_route.add_handler(q='get_peers', y='q')
+def get_peers_handler(router, get_peers_message):
+    pass
+
+@dht_route.add_handler(q='get_peers', y='r')
+def get_peers_handler(router, get_peers_message):
+    pass
+
+@dht_router.add_handler(q='announce_peer', y='q')
+def announce_peer_handler(router, announce_peer_message):
+    pass
+
+@dht_router.add_handler(q='announce_peer', y='r')
+def announce_peer_handler(router, announce_peer_message):
+    pass
+
 
