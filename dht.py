@@ -13,12 +13,48 @@ except ImportError:
     # http://pypi.python.org/pypi/weakrefset
     from weakrefset import WeakSet
 
+str_to_int = lambda s: reduce(lambda a, b: ord(b) + (a << 8), s, 0)
+def int_to_str(i):
+    buf = b''
+    while i > 0:
+        buf += chr(i % 256)
+        i >>= 8
+    return b''.join(reversed(buf))
 
 class IDHTObserver(zope.interface.Interface):
     """
     """
     def someevent(foo):
         pass
+
+import random
+class TokenManager(object):
+    def __init__(self, token_len=2):
+        self._token_len = token_len
+        self._obtained_tokens = dict() # token -> DHTNode
+        self._token_ctr = random.randint(0, 2**(8*token_len)-1)
+
+    @classmethod
+    def token_to_int(self, token):
+        assert len(token) == self._token_len
+        return str_to_int(token)
+
+    @classmethod
+    def token_to_str(self, token):
+        return int_to_str(token)
+
+    def obtain(self, node):
+        self._token_ctr += 1
+        self._obtained_tokens[self._token_ctr] = node
+        return self.token_to_str(self._token_ctr)
+
+    def check(self, token, node):
+        token = self.token_to_int(token)
+        return self._obtained_tokens[token] == node
+
+    def release(self, token):
+        token = self.token_to_int(token)
+        del self._obtained_tokens[token]
 
 
 class DHTNodeID(object):
@@ -28,7 +64,7 @@ class DHTNodeID(object):
     @classmethod
     def from_bytea(self, bytea):
         assert 20 == len(bytea), "must be length 20 (160 bits)"
-        return DHTNodeID(reduce(lambda a, b: ord(b) + (a << 8), bytea, 0))
+        return DHTNodeID(str_to_int(bytea))
 
     def distance(self, other):
         return type(self)(self.node_id ^ other.node_id)
