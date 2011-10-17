@@ -1,8 +1,18 @@
+import os
 import threading
 import blist
 import bencode
-import weakref
 import zope.interface
+import heapq
+
+try:
+    # python2.7 and python3k
+    from weakref import WeakSet
+except ImportError:
+    # pip install weakrefset
+    # http://pypi.python.org/pypi/weakrefset
+    from weakrefset import WeakSet
+
 
 class IDHTObserver(zope.interface.Interface):
     """
@@ -10,13 +20,37 @@ class IDHTObserver(zope.interface.Interface):
     def someevent(foo):
         pass
 
-class DHTNodeID(object):
-    pass
 
+class DHTNodeID(object):
+    def __init__(self, node_id):
+        self._id = node_id
+
+    @classmethod
+    def from_bytea(self, bytea):
+        assert 20 == len(bytea), "must be length 20 (160 bits)"
+        return DHTNodeID(reduce(lambda a, b: ord(b) + (a << 8), bytea, 0))
+
+    def distance(self, other):
+        return type(self)(self.node_id ^ other.node_id)
+
+    def __cmp__(self, other):
+        return cmp(self._id, other._id)
+
+    def __str__(self):
+        return "%040x" % self._id
+
+    def __repr__(self):
+        return "<DHTNodeID %s>" % str(self)
+
+    def to_bin(self):
+        return str(self).decode('hex')
+
+    def compact(self):
+        return "\0"*6 # XXX
 
 class DHTNode(object):
     def __init__(self, node_id, ip, port):
-        self._id = node_id
+        self._id = DHTNodeID(node_id)
         self._ip = ip
         self._port = port
 
@@ -24,18 +58,12 @@ class DHTNode(object):
     def node_id(self):
         return self._id
 
-    def distance(self, other):
-        return self.node_id ^ other.node_id
-
     @property
     def address(self):
         return (self._ip, self._port)
 
-    def to_bin(self):
-        return ("%040x" % self._id).decode('hex')
-
     def __repr__(self):
-        return "<DHTNode 0x%040x %s:%d>" % (self._id, self._ip, self._port)
+        return "<DHTNode %s %s:%d>" % (str(self._id), self._ip, self._port)
 
 
 class DHTBucketNode(object):
@@ -165,9 +193,10 @@ class TokenGenerator(object):
 
 class DHTRouter(object):
     def __init__(self, port):
-        self._observers = weakref.WeakSet()
-        self._buckets = DHTBucketTree()
-        self._handlers = dict()
+        self._our_id = DHTNodeID.from_bytea(os.urandom(20))
+        self._observers = WeakSet()
+        self._buckets = DHTBucketNode(self._our_id)
+        self._handlers = list()
 
     def add_observer(self, observer_obj):
         if not IDHTObserver.providedBy(observer_obj):
@@ -176,8 +205,9 @@ class DHTRouter(object):
 
     def add_handler(self, **key_req):
         def decorator(handler_func):
-            self._handlers[handler_name] = handler_func
+            self._handlers.append((key_req, handler_func))
             return handler_func
+        return decorator
 
 
 dht_router = DHTRouter(6881)
@@ -196,18 +226,27 @@ def ping_handler(router, ping_message):
 def find_node_handler(router, find_node_message):
     assert 'id' in find_node_message['a']
     assert 'target' in find_node_message['a']
-    nodes = ''
-    return {'t': find_node_message['t'], 'y': 'r', 'r': {'id': router.node_id.to_bin(), 'nodes': nodes}}
+    req_node_id = DHTNodeID.from_bytea(find_node_message['a']['id'])
+
+    # We'll just scan the whole list, since it is fairly small.
+    nodes = heapq.nsmallest(8, dht_router.all_items(),
+            lambda node: node.node_id.distance(req_node_id))
+    if nodes[0].node_id == req_node_id:
+        nodes = nodes[0:1]
+    return {'t': find_node_message['t'], 'y': 'r', 'r': {
+                'id': router.node_id.to_bin(),
+                'nodes': bencode.bencode(map(DHTNodeID.compact, nodes))
+            } }
 
 @dht_router.add_handler(q='find_node', y='r')
 def find_node_handler(router, find_node_message):
     pass
 
-@dht_route.add_handler(q='get_peers', y='q')
+@dht_router.add_handler(q='get_peers', y='q')
 def get_peers_handler(router, get_peers_message):
     pass
 
-@dht_route.add_handler(q='get_peers', y='r')
+@dht_router.add_handler(q='get_peers', y='r')
 def get_peers_handler(router, get_peers_message):
     pass
 
