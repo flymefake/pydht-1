@@ -1,15 +1,18 @@
+import random
 import os
 import threading
 import blist
 import bencode
 import zope.interface
 import heapq
+import socket
+import struct
 
 try:
     # python2.7 and python3k
     from weakref import WeakSet
 except ImportError:
-    # pip install weakrefset
+    # run: pip install weakrefset
     # http://pypi.python.org/pypi/weakrefset
     from weakrefset import WeakSet
 
@@ -21,17 +24,18 @@ def int_to_str(i):
         i >>= 8
     return b''.join(reversed(buf))
 
+
 class IDHTObserver(zope.interface.Interface):
     """
     """
     def someevent(foo):
         pass
 
-import random
+
 class TokenManager(object):
     def __init__(self, token_len=2):
         self._token_len = token_len
-        self._obtained_tokens = dict() # token -> DHTNode
+        self._acquired_tokens = dict() # token -> DHTNode
         self._token_ctr = random.randint(0, 2**(8*token_len)-1)
 
     @classmethod
@@ -43,22 +47,58 @@ class TokenManager(object):
     def token_to_str(self, token):
         return int_to_str(token)
 
-    def obtain(self, node):
+    def acquire(self, node):
         self._token_ctr += 1
-        self._obtained_tokens[self._token_ctr] = node
+        self._acquired_tokens[self._token_ctr] = node
         return self.token_to_str(self._token_ctr)
 
     def check(self, token, node):
         token = self.token_to_int(token)
-        return self._obtained_tokens[token] == node
+        return self._acquired_tokens[token] == node
 
     def release(self, token):
         token = self.token_to_int(token)
-        del self._obtained_tokens[token]
+        del self._acquired_tokens[token]
+
+
+class PeerList(object):
+    MAX_AGE = 900 # in seconds
+
+    def __init__(self):
+        self.peers = dict()
+
+    def add_peer(self, endpoint):
+        self.peers[endpoint] = time.time()
+
+    def cleanup(self):
+        for peer, last_bumped in list(self.peers.items()):
+            if last_bumped + self.MAX_AGE > time.time():
+                del self.peers[peer]
+
+    def __len__(self):
+        return len(self.peers)
+
+
+class Tracker(object):
+    def __init__(self):
+        self.peer_lists = dict()
+
+    def add_peer(self, infohash, endpoint):
+        if infohash not in self.peer_lists:
+            self.peer_lists[infohash] = PeerList()
+        self.peer_lists[infohash].add_peer(endpoint)
+
+    def cleanup(self):
+        for info_hash, peer_list in list(self.peer_lists.items()):
+            peer_list.cleanup()
+            if 0 == len(peer_list):
+                del self.peer_lists[info_hash]
 
 
 class DHTNodeID(object):
     def __init__(self, node_id):
+        if node_id is None:
+            node_id = 0
         self._id = node_id
 
     @classmethod
@@ -84,11 +124,43 @@ class DHTNodeID(object):
     def compact(self):
         return "\0"*6 # XXX
 
+class UDPEndpoint(object):
+    def __init__(self, ip, port):
+        self._ip = ip
+        self._port = port
+
+    def compact(self):
+        return socket.inet_aton(self._ip) + struct.pack("!H", self._port)
+
+    @classmethod
+    def from_compact(cls, compact_str):
+        ip = socket.inet_ntoa(compact_str[0:4])
+        port, = struct.unpack("!H", compact_str[4:6])
+        return UDPEndpoint(ip, port)
+
+    @classmethod
+    def decompact(cls, str_):
+        return map(cls.from_compact, (str_[i:i+6] for i in range(0, len(str_), 6)))
+
+
 class DHTNode(object):
     def __init__(self, node_id, ip, port):
         self._id = DHTNodeID(node_id)
         self._ip = ip
         self._port = port
+
+    def compact(self):
+        return socket.inet_aton(self._ip) + struct.pack("!H", self._port)
+
+    @classmethod
+    def from_compact(cls, compact_str):
+        ip = socket.inet_ntoa(compact_str[0:4])
+        port, = struct.unpack("!H", compact_str[4:6])
+        return (ip, port)
+
+    @classmethod
+    def decompact(cls, str_):
+        return map(cls.from_compact, (str_[i:i+6] for i in range(0, len(str_), 6)))
 
     @property
     def node_id(self):
@@ -223,43 +295,72 @@ class DHTBucketNode(object):
             raise Exception("Programmer Error")
 
 
-class TokenGenerator(object):
-    pass
-
-
 class DHTRouter(object):
+    HANDLERS = list()
     def __init__(self, port):
         self._our_id = DHTNodeID.from_bytea(os.urandom(20))
         self._observers = WeakSet()
         self._buckets = DHTBucketNode(self._our_id)
         self._handlers = list()
+        self._token_man = TokenManager()
+        self._tracker = Tracker()
 
     def add_observer(self, observer_obj):
         if not IDHTObserver.providedBy(observer_obj):
             raise TypeError("add_observer argument must implement interface IDHTObserver")
         self._observers.add(observer_obj)
 
-    def add_handler(self, **key_req):
+    def bump_node(self, node_id):
+        pass
+
+    @classmethod
+    def _cmp_key(cls, requirements, subject):
+        for key in requirements.iterkeys():
+            if key not in subject:
+                return False
+        return True
+
+    @classmethod
+    def _get_handler(cls, message):
+        for key_req, handler_func in cls.HANDLERS:
+            if cls._cmp_key(key_req, message):
+                return handler_func
+        return None
+
+    def process_message(self, src_endpoint, message):
+        message_decoded = bencode.bdecode(message)
+        handler = self._get_handler(message_decoded)
+        if handler not is None:
+            response = handler(src_endpoint, message_decoded)
+            if response is not None:
+                self.send_message(src_endpoint, bencode.bencode(response))
+        else:
+            raise Exception("Unhandled message.")
+
+    @classmethod
+    def add_handler(cls, **key_req):
         def decorator(handler_func):
-            self._handlers.append((key_req, handler_func))
+            cls.HANDLERS.append((key_req, handler_func))
             return handler_func
         return decorator
 
 
 dht_router = DHTRouter(6881)
 
-@dht_router.add_handler(q='ping', y='q')
-def ping_handler(router, ping_message):
+@DHTRouter.add_handler(q='ping', y='q')
+def ping_handler_q(router, src_endpoint, ping_message):
     assert 't' in ping_message, "Malformed ping message"
     return {'t': ping_message['t'], 'y': 'r', 'r': {'id': router.node_id.to_bin()}}
 
-@dht_router.add_handler(q='ping', y='r')
-def ping_handler(router, ping_message):
+@DHTRouter.add_handler(q='ping', y='r')
+def ping_handler_r(router, src_endpoint, ping_message):
     assert 'id' in ping_message['r'], "Malformed ping message"
     router.bump_node(ping_message['r']['id'])
+    router._token_man.release(ping_message['t'])
 
-@dht_router.add_handler(q='find_node', y='q')
-def find_node_handler(router, find_node_message):
+
+@DHTRouter.add_handler(q='find_node', y='q')
+def find_node_handler_q(router, src_endpoint, find_node_message):
     assert 'id' in find_node_message['a']
     assert 'target' in find_node_message['a']
     req_node_id = DHTNodeID.from_bytea(find_node_message['a']['id'])
@@ -268,30 +369,48 @@ def find_node_handler(router, find_node_message):
     nodes = heapq.nsmallest(8, dht_router.all_items(),
             lambda node: node.node_id.distance(req_node_id))
     if nodes[0].node_id == req_node_id:
-        nodes = nodes[0:1]
+        nodes = nodes[0:1] # if we have the node asked for, just return it.
     return {'t': find_node_message['t'], 'y': 'r', 'r': {
                 'id': router.node_id.to_bin(),
-                'nodes': bencode.bencode(map(DHTNodeID.compact, nodes))
+                'nodes': bencode.bencode(map(DHTNode.compact, nodes))
             } }
 
-@dht_router.add_handler(q='find_node', y='r')
-def find_node_handler(router, find_node_message):
+@DHTRouter.add_handler(q='find_node', y='r')
+def find_node_handler_r(router, src_endpoint, find_node_message):
+    assert 'id' in find_node_message['a']
+    assert 'nodes' in find_node_message['a']
+    # find_node_message.a.id == queried_node_id
+    nodes = UDPEndpoint.decompact(find_node_message['a']['nodes'])
+    # do something with nodes.  Add to ping queue?
     pass
 
-@dht_router.add_handler(q='get_peers', y='q')
-def get_peers_handler(router, get_peers_message):
+
+@DHTRouter.add_handler(q='get_peers', y='q')
+def get_peers_handler_q(router, src_endpoint, get_peers_message):
+    assert 'info_hash' in get_peers_message['a']
+    assert 'id' in get_peers_message['a']
     pass
 
-@dht_router.add_handler(q='get_peers', y='r')
-def get_peers_handler(router, get_peers_message):
+@DHTRouter.add_handler(q='get_peers', y='r')
+def get_peers_handler_r(router, src_endpoint, get_peers_message):
+    peers = UDPEndpoint.decompact(get_peers_message['a']['values'])
+    # some observer asked for this, tell them!
     pass
 
-@dht_router.add_handler(q='announce_peer', y='q')
-def announce_peer_handler(router, announce_peer_message):
-    pass
+@DHTRouter.add_handler(q='announce_peer', y='q')
+def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
+    assert 'id' in announce_peer_message['a']
+    assert 'info_hash' in announce_peer_message['a']
+    assert 'port' in announce_peer_message['a']
+    assert 'token' in announce_peer_message['a']
+    args = announce_peer_message['a']
+    router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
+    # TODO: add peer to our Tracker object
+    return {'id': router.node_id.to_bin()}
 
-@dht_router.add_handler(q='announce_peer', y='r')
-def announce_peer_handler(router, announce_peer_message):
-    pass
-
+@DHTRouter.add_handler(q='announce_peer', y='r')
+def announce_peer_handler_r(router, src_endpoint, announce_peer_message):
+    announce_peer_message['id']
+    # do something later?
+    return
 
