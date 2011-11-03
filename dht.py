@@ -7,6 +7,8 @@ import zope.interface
 import heapq
 import socket
 import struct
+import blist
+import operator
 
 try:
     # python2.7 and python3k
@@ -33,10 +35,12 @@ class IDHTObserver(zope.interface.Interface):
 
 
 class TokenManager(object):
+    EXPIRY_LENGTH = 300 # in seconds
     def __init__(self, token_len=2):
         self._token_len = token_len
         self._acquired_tokens = dict() # token -> DHTNode
         self._token_ctr = random.randint(0, 2**(8*token_len)-1)
+        self._expiration_queue = blist.sortedlist(key=operator.itemgetter(0))
 
     @classmethod
     def token_to_int(self, token):
@@ -47,9 +51,12 @@ class TokenManager(object):
     def token_to_str(self, token):
         return int_to_str(token)
 
-    def acquire(self, node):
+    def acquire(self, node, expiry=None):
+        if expiry is None:
+            expiry = self.EXPIRY_LENGTH
         self._token_ctr += 1
         self._acquired_tokens[self._token_ctr] = node
+        self._expiration_queue.add((time.time(), self._token_ctr))
         return self.token_to_str(self._token_ctr)
 
     def check(self, token, node):
@@ -59,6 +66,12 @@ class TokenManager(object):
     def release(self, token):
         token = self.token_to_int(token)
         del self._acquired_tokens[token]
+
+    def cleanup(self):
+        if not self._expiration_queue: return
+        while self._expiration_queue[0][0] < time.time():
+            self.release(self._expiration_queue[0][1])
+            del self._expiration_queue[i]
 
 
 class PeerList(object):
@@ -124,6 +137,7 @@ class DHTNodeID(object):
     def compact(self):
         return "\0"*6 # XXX
 
+
 class UDPEndpoint(object):
     def __init__(self, ip, port):
         self._ip = ip
@@ -141,6 +155,14 @@ class UDPEndpoint(object):
     @classmethod
     def decompact(cls, str_):
         return map(cls.from_compact, (str_[i:i+6] for i in range(0, len(str_), 6)))
+
+    @property
+    def ip(self):
+        return self._ip
+
+    @property
+    def port(self):
+        return self._port
 
 
 class DHTNode(object):
@@ -403,10 +425,11 @@ def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
     assert 'info_hash' in announce_peer_message['a']
     assert 'port' in announce_peer_message['a']
     assert 'token' in announce_peer_message['a']
+    # check if they have our token
     args = announce_peer_message['a']
-    router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
-    # TODO: add peer to our Tracker object
-    return {'id': router.node_id.to_bin()}
+    if router._token_man.check(args['token'], src_endpoint):
+        router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
+        return {'id': router.node_id.to_bin()}
 
 @DHTRouter.add_handler(q='announce_peer', y='r')
 def announce_peer_handler_r(router, src_endpoint, announce_peer_message):

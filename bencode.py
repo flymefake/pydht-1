@@ -26,7 +26,7 @@ def _bencode_dict(obj):
     s = "d"
     for key in sorted(obj.keys()):
         s += _bencode_str(key)
-        s += _bencode(obj[key])
+        s += bencode(obj[key])
     s += 'e'
     return s
 
