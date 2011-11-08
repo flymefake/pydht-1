@@ -1,3 +1,4 @@
+import hashlib
 import random
 import os
 import threading
@@ -34,44 +35,20 @@ class IDHTObserver(zope.interface.Interface):
         pass
 
 
-class TokenManager(object):
-    EXPIRY_LENGTH = 300 # in seconds
-    def __init__(self, token_len=2):
+class HashingTokenManager(object):
+    def __init__(self, token_len=6, random_data=None, digest_algo=hashlib.sha256):
+        if random_data is None:
+           random_data = os.urandom(128)
         self._token_len = token_len
-        self._acquired_tokens = dict() # token -> DHTNode
-        self._token_ctr = random.randint(0, 2**(8*token_len)-1)
-        self._expiration_queue = blist.sortedlist(key=operator.itemgetter(0))
+        self._random_data = random_data
+        self._digest_algo = digest_algo
 
-    @classmethod
-    def token_to_int(self, token):
-        assert len(token) == self._token_len
-        return str_to_int(token)
+    def acquire(self, compactible):
+        return hashlib.sha256(self._random_data + compactible.compact() + \
+                self._random_data).digest()[0:self._token_len]
 
-    @classmethod
-    def token_to_str(self, token):
-        return int_to_str(token)
-
-    def acquire(self, node, expiry=None):
-        if expiry is None:
-            expiry = self.EXPIRY_LENGTH
-        self._token_ctr += 1
-        self._acquired_tokens[self._token_ctr] = node
-        self._expiration_queue.add((time.time(), self._token_ctr))
-        return self.token_to_str(self._token_ctr)
-
-    def check(self, token, node):
-        token = self.token_to_int(token)
-        return self._acquired_tokens[token] == node
-
-    def release(self, token):
-        token = self.token_to_int(token)
-        del self._acquired_tokens[token]
-
-    def cleanup(self):
-        if not self._expiration_queue: return
-        while self._expiration_queue[0][0] < time.time():
-            self.release(self._expiration_queue[0][1])
-            del self._expiration_queue[i]
+    def check(self, token, compactible):
+        return token == self.acquire(compactible)
 
 
 class PeerList(object):
@@ -122,6 +99,9 @@ class DHTNodeID(object):
     def distance(self, other):
         return type(self)(self.node_id ^ other.node_id)
 
+    def __int__(self):
+        return self._id
+
     def __cmp__(self, other):
         return cmp(self._id, other._id)
 
@@ -133,9 +113,6 @@ class DHTNodeID(object):
 
     def to_bin(self):
         return str(self).decode('hex')
-
-    def compact(self):
-        return "\0"*6 # XXX
 
 
 class UDPEndpoint(object):
@@ -196,6 +173,50 @@ class DHTNode(object):
         return "<DHTNode %s %s:%d>" % (str(self._id), self._ip, self._port)
 
 
+class DHTBucketNodeRecord(object):
+    MAX_GOOD_AGE = 15*60 # max age before the node stops bein `good' 
+    BADNESS_THRESHOLD = 4
+
+    def __init__(self, dht_node, last_seen):
+        self._badness = 0
+        self._node = dht_node
+        if last_seen is None:
+            last_seen = time.time()
+        self._last_seen = last_seen
+
+    def is_good(self):
+        return self.age + self.MAX_GOOD_AGE <= time.time()
+
+    def is_bad(self):
+        return not self.is_good() and \
+                self._badness >= self.BADNESS_THRESHOLD
+
+    def is_questionable(self):
+        return time.time() < self.age + self.MAX_GOOD_AGE and \
+                self._badness < self.BADNESS_THRESHOLD
+
+    def __state_str(self):
+        if self.is_good(): return "good"
+        if self.is_questionable(): return "questionable"
+        if self.is_bad(): return "bad"
+
+    @property
+    def node(self):
+        return self._node
+
+    @property
+    def age(self):
+        return time.time() - self._last_seen
+
+    def bump(self):
+        self._last_seen = time.time()
+        self._badness = 0
+
+    def __repr__(self):
+        return "<DHTBucketNodeRecord %s age=%.1fs dht_node=%s>" % (
+                self.__state_str(), self.age, repr(self._node))
+
+
 class DHTBucketNode(object):
     """
     Can contain items who have IDs in min <= item_id < max
@@ -213,7 +234,7 @@ class DHTBucketNode(object):
         self._min = minimum_id is not None and minimum_id or 0
         self._max = maximum_id is not None and maximum_id or 2**160
         self._children = None
-        self._items = blist.sortedlist(key=lambda item: item.node_id)
+        self._items = blist.sortedlist(key=lambda item: item.node.node_id)
 
     def is_interior_node(self):
         assert (self._items is not None) ^ (self._children is not None)
@@ -230,7 +251,7 @@ class DHTBucketNode(object):
         return self._min <= id < self._max
 
     def accepts_item(self, item):
-        return self._min <= item.node_id < self._max
+        return self._min <= item.node.node_id < self._max
 
     def __split(self):
         left = type(self)(self._our_id, self._min, (self._min + self._max)/2)
@@ -275,7 +296,7 @@ class DHTBucketNode(object):
                 item = item or ch.find_item(item_id)
             return item
         elif self.is_leaf_node(self):
-            matching_items = filter(lambda i: i.node_id == item_id, self._items)
+            matching_items = filter(lambda i: i.node.node_id == item_id, self._items)
             if matching_items:
                 return matching_items[0]
             return False
@@ -324,7 +345,7 @@ class DHTRouter(object):
         self._observers = WeakSet()
         self._buckets = DHTBucketNode(self._our_id)
         self._handlers = list()
-        self._token_man = TokenManager()
+        self._token_man = HashingTokenManager()
         self._tracker = Tracker()
 
     def add_observer(self, observer_obj):
@@ -332,8 +353,12 @@ class DHTRouter(object):
             raise TypeError("add_observer argument must implement interface IDHTObserver")
         self._observers.add(observer_obj)
 
-    def bump_node(self, node_id):
-        pass
+    def bump_node(self, node):
+        node_rec = self._buckets.find_item(int(node))
+        if node:
+            node_rec.bump()
+        else:
+            self._token_man.add_node(node)
 
     @classmethod
     def _cmp_key(cls, requirements, subject):
@@ -352,7 +377,7 @@ class DHTRouter(object):
     def process_message(self, src_endpoint, message):
         message_decoded = bencode.bdecode(message)
         handler = self._get_handler(message_decoded)
-        if handler not is None:
+        if handler is not None:
             response = handler(src_endpoint, message_decoded)
             if response is not None:
                 self.send_message(src_endpoint, bencode.bencode(response))
@@ -372,13 +397,21 @@ dht_router = DHTRouter(6881)
 @DHTRouter.add_handler(q='ping', y='q')
 def ping_handler_q(router, src_endpoint, ping_message):
     assert 't' in ping_message, "Malformed ping message"
-    return {'t': ping_message['t'], 'y': 'r', 'r': {'id': router.node_id.to_bin()}}
+    router.send_message(src_endpoint, {
+            't': ping_message['t'],
+            'y': 'r',
+            'r': {
+                'id': router.node_id.to_bin()
+            }
+        } )
 
 @DHTRouter.add_handler(q='ping', y='r')
 def ping_handler_r(router, src_endpoint, ping_message):
     assert 'id' in ping_message['r'], "Malformed ping message"
-    router.bump_node(ping_message['r']['id'])
-    router._token_man.release(ping_message['t'])
+    if router._token_man.check(src_endpoint, ping_message['t']):
+        router.bump_node(
+                int(DHTNodeID.from_bytea(ping_message['r']['id'])))
+    # router._token_man.release(ping_message['t'])
 
 
 @DHTRouter.add_handler(q='find_node', y='q')
@@ -388,14 +421,19 @@ def find_node_handler_q(router, src_endpoint, find_node_message):
     req_node_id = DHTNodeID.from_bytea(find_node_message['a']['id'])
 
     # We'll just scan the whole list, since it is fairly small.
-    nodes = heapq.nsmallest(8, dht_router.all_items(),
-            lambda node: node.node_id.distance(req_node_id))
+    good_nodes = itertools.ifilter(DHTBucketNodeRecord.is_good, dht_router.all_items())
+    close_nodes = heapq.nsmallest(8, good_nodes,
+            lambda item: item.node.node_id.distance(req_node_id))
     if nodes[0].node_id == req_node_id:
         nodes = nodes[0:1] # if we have the node asked for, just return it.
-    return {'t': find_node_message['t'], 'y': 'r', 'r': {
+    router.send_message(src_endpoint, {
+            't': find_node_message['t'],
+            'y': 'r',
+            'r': {
                 'id': router.node_id.to_bin(),
                 'nodes': bencode.bencode(map(DHTNode.compact, nodes))
-            } }
+            }
+        } )
 
 @DHTRouter.add_handler(q='find_node', y='r')
 def find_node_handler_r(router, src_endpoint, find_node_message):
@@ -403,6 +441,7 @@ def find_node_handler_r(router, src_endpoint, find_node_message):
     assert 'nodes' in find_node_message['a']
     # find_node_message.a.id == queried_node_id
     nodes = UDPEndpoint.decompact(find_node_message['a']['nodes'])
+
     # do something with nodes.  Add to ping queue?
     pass
 
@@ -429,7 +468,9 @@ def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
     args = announce_peer_message['a']
     if router._token_man.check(args['token'], src_endpoint):
         router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
-        return {'id': router.node_id.to_bin()}
+        router.send_message(src_endpoint, {'id': router.node_id.to_bin()})
+    else:
+        logging.debug("%s sent us a bad token." % repr(src_endpoint))
 
 @DHTRouter.add_handler(q='announce_peer', y='r')
 def announce_peer_handler_r(router, src_endpoint, announce_peer_message):
