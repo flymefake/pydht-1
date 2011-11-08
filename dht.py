@@ -29,14 +29,13 @@ def int_to_str(i):
 
 
 class IDHTObserver(zope.interface.Interface):
-    """
-    """
-    def someevent(foo):
-        pass
+    def notify(message_type, message):
+        """
+        """
 
 
 class HashingTokenManager(object):
-    def __init__(self, token_len=6, random_data=None, digest_algo=hashlib.sha256):
+    def __init__(self, token_len=2, random_data=None, digest_algo=hashlib.sha256):
         if random_data is None:
            random_data = os.urandom(128)
         self._token_len = token_len
@@ -44,10 +43,10 @@ class HashingTokenManager(object):
         self._digest_algo = digest_algo
 
     def acquire(self, compactible):
-        return hashlib.sha256(self._random_data + compactible.compact() + \
+        return hashlib.sha256(self._random_data + (compactible.compact()) + \
                 self._random_data).digest()[0:self._token_len]
 
-    def check(self, token, compactible):
+    def check(self, compactible, token):
         return token == self.acquire(compactible)
 
 
@@ -69,6 +68,24 @@ class PeerList(object):
         return len(self.peers)
 
 
+class AnnounceList(object):
+    class Handle(object): pass
+
+    def __init__(self):
+        self._items = dict()
+
+    def add(self, info_hash, port):
+        key = self.Handle()
+        self._items[key] = (info_hash, port)
+        return key
+
+    def remove(self, key):
+        del self._items[key]
+
+    def __iter__(self):
+        return iter(list(self._items.iteritems()))
+
+
 class Tracker(object):
     def __init__(self):
         self.peer_lists = dict()
@@ -87,6 +104,8 @@ class Tracker(object):
 
 class DHTNodeID(object):
     def __init__(self, node_id):
+        if isinstance(node_id, str):
+            node_id = int(DHTNodeID.from_bytea(node_id))
         if node_id is None:
             node_id = 0
         self._id = node_id
@@ -100,7 +119,7 @@ class DHTNodeID(object):
         return type(self)(self.node_id ^ other.node_id)
 
     def __int__(self):
-        return self._id
+        return int(self._id)
 
     def __cmp__(self, other):
         return cmp(self._id, other._id)
@@ -148,8 +167,15 @@ class DHTNode(object):
         self._ip = ip
         self._port = port
 
+    def __int__(self):
+        return int(self._id)
+
     def compact(self):
         return socket.inet_aton(self._ip) + struct.pack("!H", self._port)
+
+    @classmethod
+    def from_endpoint(cls, endpoint, node_id):
+        return cls(DHTNodeID(node_id), endpoint.ip, endpoint.port)
 
     @classmethod
     def from_compact(cls, compact_str):
@@ -347,6 +373,11 @@ class DHTRouter(object):
         self._handlers = list()
         self._token_man = HashingTokenManager()
         self._tracker = Tracker()
+        self._announce_list = AnnounceList()
+
+    @property
+    def node_id(self):
+        return self._our_id
 
     def add_observer(self, observer_obj):
         if not IDHTObserver.providedBy(observer_obj):
@@ -378,11 +409,11 @@ class DHTRouter(object):
         message_decoded = bencode.bdecode(message)
         handler = self._get_handler(message_decoded)
         if handler is not None:
-            response = handler(src_endpoint, message_decoded)
+            response = handler(self, src_endpoint, message_decoded)
             if response is not None:
                 self.send_message(src_endpoint, bencode.bencode(response))
         else:
-            raise Exception("Unhandled message.")
+            raise Exception("Unhandled message.: %s" % repr(message_decoded))
 
     @classmethod
     def add_handler(cls, **key_req):
@@ -391,8 +422,16 @@ class DHTRouter(object):
             return handler_func
         return decorator
 
+    def add_announce(self, info_hash, port):
+        return self._announce_list.add(info_hash, port)
 
-dht_router = DHTRouter(6881)
+    def bootstrap_with_endpoint(self, endpoint=None):
+        token = self._token_man.acquire(endpoint)
+        self.send_message(endpoint, {
+                'q': 'ping', 't': token, 'y': 'q', 'a': {
+                'id': self.node_id.to_bin()
+            } } )
+
 
 @DHTRouter.add_handler(q='ping', y='q')
 def ping_handler_q(router, src_endpoint, ping_message):
@@ -405,12 +444,13 @@ def ping_handler_q(router, src_endpoint, ping_message):
             }
         } )
 
-@DHTRouter.add_handler(q='ping', y='r')
+
+@DHTRouter.add_handler(y='r')
 def ping_handler_r(router, src_endpoint, ping_message):
+    print repr((router, src_endpoint, ping_message))
     assert 'id' in ping_message['r'], "Malformed ping message"
     if router._token_man.check(src_endpoint, ping_message['t']):
-        router.bump_node(
-                int(DHTNodeID.from_bytea(ping_message['r']['id'])))
+        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
     # router._token_man.release(ping_message['t'])
 
 
@@ -435,13 +475,17 @@ def find_node_handler_q(router, src_endpoint, find_node_message):
             }
         } )
 
+
 @DHTRouter.add_handler(q='find_node', y='r')
 def find_node_handler_r(router, src_endpoint, find_node_message):
     assert 'id' in find_node_message['a']
     assert 'nodes' in find_node_message['a']
     # find_node_message.a.id == queried_node_id
+    if router._token_man.check(src_endpoint, ping_message['t']):
+        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
     nodes = UDPEndpoint.decompact(find_node_message['a']['nodes'])
-
+    for node in nodes:
+        pass
     # do something with nodes.  Add to ping queue?
     pass
 
@@ -452,11 +496,15 @@ def get_peers_handler_q(router, src_endpoint, get_peers_message):
     assert 'id' in get_peers_message['a']
     pass
 
+
 @DHTRouter.add_handler(q='get_peers', y='r')
 def get_peers_handler_r(router, src_endpoint, get_peers_message):
+    if router._token_man.check(src_endpoint, ping_message['t']):
+        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
     peers = UDPEndpoint.decompact(get_peers_message['a']['values'])
-    # some observer asked for this, tell them!
-    pass
+    for obs in router._observers:
+        obs.notify('get_peers', peers)
+
 
 @DHTRouter.add_handler(q='announce_peer', y='q')
 def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
@@ -466,15 +514,17 @@ def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
     assert 'token' in announce_peer_message['a']
     # check if they have our token
     args = announce_peer_message['a']
+    if router._token_man.check(src_endpoint, ping_message['t']):
+        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
     if router._token_man.check(args['token'], src_endpoint):
         router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
         router.send_message(src_endpoint, {'id': router.node_id.to_bin()})
     else:
         logging.debug("%s sent us a bad token." % repr(src_endpoint))
 
+
 @DHTRouter.add_handler(q='announce_peer', y='r')
 def announce_peer_handler_r(router, src_endpoint, announce_peer_message):
-    announce_peer_message['id']
-    # do something later?
+    if router._token_man.check(src_endpoint, ping_message['t']):
+        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
     return
-
