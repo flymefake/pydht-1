@@ -238,6 +238,9 @@ class DHTBucketNodeRecord(object):
         self._last_seen = time.time()
         self._badness = 0
 
+    def unbump(self): # XXX
+        self._badness += 1
+
     def __repr__(self):
         return "<DHTBucketNodeRecord %s age=%.1fs dht_node=%s>" % (
                 self.__state_str(), self.age, repr(self._node))
@@ -351,6 +354,37 @@ class DHTBucketNode(object):
                 for i in self._items:
                     yield i
 
+    def age(self):
+        if self.is_interior_node():
+            return min(ch.age for ch in self._children)
+        elif self.is_leaf_node():
+            with self._mut_lock:
+                return min(i.age for i in self._items)
+
+    def oldest_bucket(self):
+        if self.is_interior_node():
+            return max(self._children, key=lambda ch: ch.age).oldest_bucket()
+        elif self.is_leaf_node():
+            return self
+
+    def oldest_node(self):
+        if self.is_interior_node():
+            return self.oldest_bucket().oldest_node()
+        elif self.is_leaf_node():
+            return max(self._items, key=lambda i: i.age)
+
+    def cleanup(self):
+        if self.is_interior_node():
+            for ch in self._children:
+                ch.cleanup()
+        elif self.is_leaf_node():
+            for item in self._items:
+                if item.is_bad():
+                    self._items.remove(item)
+
+    def child_item_count(self):
+        return len(self._children)
+
     def __repr__(self):
         if self.is_interior_node():
             return "<DHTBucketNode {0x%x <= id < 0x%x} ours=%s %s>" % (
@@ -431,6 +465,17 @@ class DHTRouter(object):
                 'q': 'ping', 't': token, 'y': 'q', 'a': {
                 'id': self.node_id.to_bin()
             } } )
+
+    def continue_bootstrap(self):
+        # get_peers on self.node_id
+        # get_peers on any underfilled bucket
+
+    def cleanup(self):
+        self._buckets.cleanup()
+        oldest_node = self._buckets.oldest_node()
+        oldest_node.unbump()
+        # send ping to oldest_node
+
 
 
 @DHTRouter.add_handler(q='ping', y='q')
