@@ -106,6 +106,8 @@ class DHTNodeID(object):
     def __init__(self, node_id):
         if isinstance(node_id, str):
             node_id = int(DHTNodeID.from_bytea(node_id))
+        elif isinstance(node_id, DHTNodeID):
+            node_id = node_id.node_id
         if node_id is None:
             node_id = 0
         self._id = node_id
@@ -114,6 +116,10 @@ class DHTNodeID(object):
     def from_bytea(self, bytea):
         assert 20 == len(bytea), "must be length 20 (160 bits)"
         return DHTNodeID(str_to_int(bytea))
+
+    @property
+    def node_id(self):
+        return self._id
 
     def distance(self, other):
         return type(self)(self.node_id ^ other.node_id)
@@ -472,6 +478,7 @@ class DHTRouter(object):
     def continue_bootstrap(self):
         # get_peers on self.node_id
         # get_peers on any underfilled bucket
+        pass
 
     def cleanup(self):
         self._buckets.cleanup()
