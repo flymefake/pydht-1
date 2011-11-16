@@ -382,6 +382,9 @@ class DHTBucketNode(object):
                 if item.is_bad():
                     self._items.remove(item)
 
+    def item_count(self):
+        raise NotImplementedError
+
     def child_item_count(self):
         return len(self._children)
 
