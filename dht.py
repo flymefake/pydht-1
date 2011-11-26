@@ -35,6 +35,19 @@ class IDHTObserver(zope.interface.Interface):
         """
         """
 
+class TransactionManager(object):
+    def __init__(self, token_len=2):
+        self._token_len = token_len
+
+    def get(self, compactible):
+        pass # return extra
+
+    def acquire(self, compactible, extra=None):
+        pass
+
+    def release(self, compactible):
+        pass
+
 
 class HashingTokenManager(object):
     def __init__(self, token_len=2, random_data=None, digest_algo=hashlib.sha256):
@@ -51,23 +64,6 @@ class HashingTokenManager(object):
     def check(self, compactible, token):
         return token == self.acquire(compactible)
 
-
-class PeerList(object):
-    MAX_AGE = 900 # in seconds
-
-    def __init__(self):
-        self.peers = dict()
-
-    def add_peer(self, endpoint):
-        self.peers[endpoint] = time.time()
-
-    def cleanup(self):
-        for peer, last_bumped in list(self.peers.items()):
-            if last_bumped + self.MAX_AGE > time.time():
-                del self.peers[peer]
-
-    def __len__(self):
-        return len(self.peers)
 
 
 class AnnounceList(object):
@@ -88,20 +84,49 @@ class AnnounceList(object):
         return iter(list(self._items.iteritems()))
 
 
-class Tracker(object):
-    def __init__(self):
-        self.peer_lists = dict()
+class PeerSet(object):
+    """
+    Set with Expiry
+    """
+    MAX_AGE = 900 # in seconds
 
-    def add_peer(self, infohash, endpoint):
-        if infohash not in self.peer_lists:
-            self.peer_lists[infohash] = PeerList()
-        self.peer_lists[infohash].add_peer(endpoint)
+    def __init__(self):
+        self.peers = dict()
+
+    def add_peer(self, endpoint):
+        self.peers[endpoint] = time.time()
 
     def cleanup(self):
-        for info_hash, peer_list in list(self.peer_lists.items()):
-            peer_list.cleanup()
-            if 0 == len(peer_list):
-                del self.peer_lists[info_hash]
+        for peer, last_bumped in list(self.peers.items()):
+            if last_bumped + self.MAX_AGE > time.time():
+                del self.peers[peer]
+
+    def __iter__(self):
+        return self.peers.keys()
+
+    def __len__(self):
+        return len(self.peers)
+
+
+class Tracker(object):
+    def __init__(self):
+        self.peer_sets = dict()
+
+    def add_peer(self, infohash, endpoint):
+        if infohash not in self.peer_sets:
+            self.peer_sets[infohash] = PeerSet()
+        self.peer_sets[infohash].add_peer(endpoint)
+
+    def get_peers(self, infohash):
+        if infohash not in self.peer_sets:
+            return PeerSet()
+        return self.peer_sets[infohash]
+
+    def cleanup(self):
+        for info_hash, peer_set in list(self.peer_sets.items()):
+            peer_set.cleanup()
+            if 0 == len(peer_set):
+                del self.peer_sets[info_hash]
 
 
 class DHTNodeID(object):
@@ -201,14 +226,17 @@ class DHTNode(object):
 
     @property
     def address(self):
-        return (self._ip, self._port)
+        return UDPEndpoint(self._ip, self._port)
 
     def __repr__(self):
         return "<DHTNode %s %s:%d>" % (str(self._id), self._ip, self._port)
 
 
 class DHTBucketNodeRecord(object):
-    MAX_GOOD_AGE = 15*60 # max age before the node stops bein `good' 
+    """
+    Record for maintaining bookkeeping data about a node.
+    """
+    MAX_GOOD_AGE = 15*60 # max age before the node stops being `good'
     BADNESS_THRESHOLD = 4
 
     def __init__(self, dht_node, last_seen):
@@ -217,17 +245,26 @@ class DHTBucketNodeRecord(object):
         if last_seen is None:
             last_seen = time.time()
         self._last_seen = last_seen
+        self._last_pinged = 0
+
+    def is_clean(self):
+        """
+        Has been seen in the last MAX_GOOD_AGE seconds and has a badness of
+        zero.
+        """
+        return self._badness == 0 and \
+                self.age + self.MAX_GOOD_AGE <= time.time()
 
     def is_good(self):
-        return self.age + self.MAX_GOOD_AGE <= time.time()
-
-    def is_bad(self):
-        return not self.is_good() and \
-                self._badness >= self.BADNESS_THRESHOLD
+        return self._badness < self.BADNESS_THRESHOLD and \
+                self.age + self.MAX_GOOD_AGE <= time.time()
 
     def is_questionable(self):
-        return time.time() < self.age + self.MAX_GOOD_AGE and \
-                self._badness < self.BADNESS_THRESHOLD
+        return self._badness < self.BADNESS_THRESHOLD and
+                time.time() < self.age + self.MAX_GOOD_AGE
+
+    def is_bad(self):
+        return self.BADNESS_THRESHOLD <= self._badness
 
     def __state_str(self):
         if self.is_good(): return "good"
@@ -240,13 +277,22 @@ class DHTBucketNodeRecord(object):
 
     @property
     def age(self):
+        """Amount of time (in seconds) since node was last seen"""
         return time.time() - self._last_seen
 
     def bump(self):
+        """
+        Called when we receive a response from the node, clearing its badness.
+        """
         self._last_seen = time.time()
         self._badness = 0
 
-    def unbump(self): # XXX
+    def unbump(self):
+        """
+        Called when we send a `ping' to a node so that we can maintain state
+        on its badness.
+        """
+        self._last_pinged = time.time()
         self._badness += 1
 
     def __repr__(self):
@@ -430,9 +476,11 @@ class DHTRouter(object):
         self._observers = WeakSet()
         self._buckets = DHTBucketNode(self._our_id)
         self._handlers = list()
-        self._token_man = HashingTokenManager()
+        self._token_man = HashingTokenManager(token_len=8)
+        self._transaction_man = TransactionManager(token_len=2)
         self._tracker = Tracker()
         self._announce_list = AnnounceList()
+        self._write_tokens = dict()
 
     @property
     def node_id(self):
@@ -492,30 +540,39 @@ class DHTRouter(object):
                     'id': self.node_id.to_bin()
             } } )
 
-    def continue_bootstrap(self):
-        # find_node on self.node_id
-        # find_node on any underfilled bucket?
-        for bucket in self.iter_leaf_buckets():
-            if not bucket.is_full():
-                search_for = bucket.get_random_id()
-                self.send_message(endpoint, {
-                        'q': 'find_node', 't': token, 'y': 'q', 'a': {
-                            'id': self.node_id.to_bin(),
-                            'target': search_for.to_bin(),
-                    } } )
-        token = self._token_man.aquire(endpoint)
+    def _bucket_refresh_self(self):
+        token = self._token_man.acquire(endpoint)
         self.send_mesage(endpoint, {
                 'q': 'get_peers', 't': token, 'y': 'q', 'a': {
                     'id': self.node_id.to_bin(),
                     'target': self.node_id.distance(1).to_bin()
             } } )
 
+    def _bucket_refresh_underfilled(self):
+        for bucket in self.iter_leaf_buckets():
+            if not bucket.is_full():
+                search_for = bucket.get_random_id()
+                # Find closest clean node.
+                target_node = min(filter(DHTBucketNodeRecord.is_clean,
+                    bucket.all_items, key=lambda item: item.node.node_id.distance(search_for))
+
+                target_node.unbump()
+                self.send_message(target_node.address, {
+                        'q': 'find_node', 't': token, 'y': 'q', 'a': {
+                            'id': self.node_id.to_bin(),
+                            'target': search_for.to_bin(),
+                    } } )
+
     def cleanup(self):
         self._buckets.cleanup()
         oldest_node = self._buckets.oldest_node()
         oldest_node.unbump()
-        # send ping to oldest_node
-
+        self.send_message(oldest_node.address, {
+                't': self._token_man.acquire(oldest_node.address),
+                'y': 'q', 'q': 'ping', 'a': {
+                    'id': self.node_id.to_bin(),
+                }
+            } )
 
 
 @DHTRouter.add_handler(q='ping', y='q')
@@ -536,7 +593,6 @@ def ping_handler_r(router, src_endpoint, ping_message):
     assert 'id' in ping_message['r'], "Malformed ping message"
     if router._token_man.check(src_endpoint, ping_message['t']):
         router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
-    # router._token_man.release(ping_message['t'])
 
 
 @DHTRouter.add_handler(q='find_node', y='q')
@@ -568,24 +624,45 @@ def find_node_handler_r(router, src_endpoint, find_node_message):
     # find_node_message.a.id == queried_node_id
     if router._token_man.check(src_endpoint, ping_message['t']):
         router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
-    nodes = UDPEndpoint.decompact(find_node_message['a']['nodes'])
-    for node in nodes:
-        pass
-    # do something with nodes.  Add to ping queue?
-    pass
+    endpoints = UDPEndpoint.decompact(find_node_message['a']['nodes'])
+    for endpoint in endpoints:
+        router.send_message(endpoint, {
+                't': self._token_man.acquire(endpoint),
+                'y': 'q', 'q': 'ping',
+                'a': {'id': router.node_id.to_bin()}
+            })
 
 
 @DHTRouter.add_handler(q='get_peers', y='q')
 def get_peers_handler_q(router, src_endpoint, get_peers_message):
     assert 'info_hash' in get_peers_message['a']
     assert 'id' in get_peers_message['a']
-    pass
+    peers = router._tracker.get_peers(get_peers_message['a']['info_hash'])
+    write_token = router._token_man.acquire(src_endpoint)
+    if len(peers) > 0:
+        router.send_message(src_endpoint, {
+                't': get_peers_message['t'],
+                'y': 'r', 'r': {
+                    'id': router.node_id.to_bin(),
+                    'token': write_token,
+                    'values': list__COMPACTED_PEERS__,
+            } } )
+    else:
+        router.send_message(src_endpoint, {
+                't': get_peers_message['t'],
+                'y': 'r', 'r': {
+                    'id': router.node_id.to_bin(),
+                    'token': write_token,
+                    'nodes': bytea__COMPACTED_NODES__,
+            } } )
+
 
 
 @DHTRouter.add_handler(q='get_peers', y='r')
 def get_peers_handler_r(router, src_endpoint, get_peers_message):
     if router._token_man.check(src_endpoint, ping_message['t']):
         router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
+    # TODO: add something to router._write_tokens so we can announce
     peers = UDPEndpoint.decompact(get_peers_message['a']['values'])
     for obs in router._observers:
         obs.notify('get_peers', peers)
