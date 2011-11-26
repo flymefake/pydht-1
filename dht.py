@@ -11,6 +11,8 @@ import struct
 import blist
 import operator
 
+# TODO: We have a lot of large classes.  Refactoring would be nice.
+
 try:
     # python2.7 and python3k
     from weakref import WeakSet
@@ -255,8 +257,6 @@ class DHTBucketNodeRecord(object):
 class DHTBucketNode(object):
     """
     Can contain items who have IDs in min <= item_id < max
-
-    This class should be Thread-safe
     """
     # TODO: fix datastructure, this tree is degenerate
     # Within this class, an `item' is a DHTNode and a `node' is part of the tree
@@ -281,6 +281,9 @@ class DHTBucketNode(object):
 
     def is_full(self):
         return len(self._items) >= self.MAX_ITEMS
+
+    def get_random_id(self):
+        return DHTNodeID(random.randint(self._min, self._max))
 
     def accepts_id(self, id):
         return self._min <= id < self._max
@@ -310,7 +313,12 @@ class DHTBucketNode(object):
                 if self.accepts_id(self._our_id):
                     self.__split()
                     return self.__add_item(item)
-                return False
+                # Remove a bad item to make way for the new one when we are
+                # full
+                for item in self.all_items():
+                    if item.is_bad():
+                        self._items.remove(item)
+                        break
             self._items.add(item)
         else:
             raise Exception("Programmer Error")
@@ -346,6 +354,14 @@ class DHTBucketNode(object):
             return False
         with self._mut_lock:
             return self.__find_item(item_id)
+
+    def iter_leaf_buckets(self):
+        if self.is_interior_node():
+            for ch in self._children:
+                for item in children.iterleaf():
+                    yield item
+        elif self.is_leaf_node():
+            yield self
 
     def all_items(self):
         """
@@ -427,12 +443,13 @@ class DHTRouter(object):
             raise TypeError("add_observer argument must implement interface IDHTObserver")
         self._observers.add(observer_obj)
 
-    def bump_node(self, node):
-        node_rec = self._buckets.find_item(int(node))
-        if node:
-            node_rec.bump()
-        else:
-            self._token_man.add_node(node)
+    def add_node(self, node):
+        accepting_bucket = None
+        for bucket in self._buckets.iter_leaf_buckets():
+            if bucket.accepts_id(int(node)):
+                accepting_bucket = bucket
+        assert accepting_bucket is not None
+        accepting_bucket.add_item(node)
 
     @classmethod
     def _cmp_key(cls, requirements, subject):
@@ -472,13 +489,26 @@ class DHTRouter(object):
         token = self._token_man.acquire(endpoint)
         self.send_message(endpoint, {
                 'q': 'ping', 't': token, 'y': 'q', 'a': {
-                'id': self.node_id.to_bin()
+                    'id': self.node_id.to_bin()
             } } )
 
     def continue_bootstrap(self):
-        # get_peers on self.node_id
-        # get_peers on any underfilled bucket
-        pass
+        # find_node on self.node_id
+        # find_node on any underfilled bucket?
+        for bucket in self.iter_leaf_buckets():
+            if not bucket.is_full():
+                search_for = bucket.get_random_id()
+                self.send_message(endpoint, {
+                        'q': 'find_node', 't': token, 'y': 'q', 'a': {
+                            'id': self.node_id.to_bin(),
+                            'target': search_for.to_bin(),
+                    } } )
+        token = self._token_man.aquire(endpoint)
+        self.send_mesage(endpoint, {
+                'q': 'get_peers', 't': token, 'y': 'q', 'a': {
+                    'id': self.node_id.to_bin(),
+                    'target': self.node_id.distance(1).to_bin()
+            } } )
 
     def cleanup(self):
         self._buckets.cleanup()
@@ -570,9 +600,11 @@ def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
     # check if they have our token
     args = announce_peer_message['a']
     if router._token_man.check(src_endpoint, ping_message['t']):
-        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
+        router.bump_node(DHTNode.from_endpoint(src_endpoint,
+            ping_message['r']['id']))
     if router._token_man.check(args['token'], src_endpoint):
-        router._tracker.add_peer((src_endpoint.ip, args['port']), args['info_hash'])
+        router._tracker.add_peer((src_endpoint.ip, args['port']),
+                args['info_hash'])
         router.send_message(src_endpoint, {'id': router.node_id.to_bin()})
     else:
         logging.debug("%s sent us a bad token." % repr(src_endpoint))
@@ -581,5 +613,6 @@ def announce_peer_handler_q(router, src_endpoint, announce_peer_message):
 @DHTRouter.add_handler(q='announce_peer', y='r')
 def announce_peer_handler_r(router, src_endpoint, announce_peer_message):
     if router._token_man.check(src_endpoint, ping_message['t']):
-        router.bump_node(DHTNode.from_endpoint(src_endpoint, ping_message['r']['id']))
+        router.bump_node(DHTNode.from_endpoint(src_endpoint,
+            ping_message['r']['id']))
     return
