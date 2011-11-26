@@ -35,6 +35,13 @@ class IDHTObserver(zope.interface.Interface):
         """
         """
 
+# Maybe we want to add callbacks to this?
+# Model:
+#   dict : (endpoint, transaction_id) => {callback_0, ..., callback_n}
+# Details:
+#   TM.acquire(endpoint) => bytea
+#   TM.add_callback(endpoint, bytea, callback) => None
+#   TM.release(endpoint, bytea) will atomically call and clear the callbacks.
 class TransactionManager(object):
     def __init__(self, token_len=2):
         self._token_len = token_len
