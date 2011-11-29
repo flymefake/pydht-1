@@ -1,8 +1,8 @@
+import time
 import hashlib
 import random
 import os
 import threading
-import blist
 import bencode
 import zope.interface
 import heapq
@@ -37,23 +37,71 @@ class IDHTObserver(zope.interface.Interface):
 
 # Maybe we want to add callbacks to this?
 # Model:
-#   dict : (endpoint, transaction_id) => {callback_0, ..., callback_n}
+#   dict : (endpoint, transaction_id) => [callback_0, ..., callback_n]
 # Details:
 #   TM.acquire(endpoint) => bytea
 #   TM.add_callback(endpoint, bytea, callback) => None
 #   TM.release(endpoint, bytea) will atomically call and clear the callbacks.
 class TransactionManager(object):
-    def __init__(self, token_len=2):
-        self._token_len = token_len
+    MAX_AGE = 3600 # in seconds
+    class TransactionToken(object):
+        def __init__(self, manager, compactible, transaction_id):
+            self.manager = manager
+            self.compactible = compactible
+            self.transaction_id = transaction_id
 
-    def get(self, compactible):
-        pass # return extra
+        def add_callback(self, func):
+            self.manager.add_callback(self.compactible, self.transaction_id, func)
+
+        def to_bin(self):
+            return int_to_str(self.transaction_id).\
+                    rjust(self.manager._transaction_len, b"\x00")
+
+    class ExpiryRecord(object):
+        def __init__(self, key, created_at=None):
+            self.key = key
+            if created_at is None:
+                created_at = time.time()
+            self.created_at = created_at
+
+    def __init__(self, transaction_len=2):
+        self._transactions = dict()
+        self._transaction_ctrs = dict()
+        self._transaction_len = token_len
+        self._transaction_expiry = blist.sortedlist(key=lambda item: item.created_at)
+
+    def _get_next_transaction(self, compactible):
+        if endpoint not in self._transaction_len:
+            self._transaction_len[compactible] = 0
+        while True:
+            tmp = self._transaction_len[compactible]
+            self._transaction_len[compactible] += 1
+            self._transaction_len[compactible] %= 256**self._transaction_len
+            if (compactible, tmp) not in self._transactions:
+                break
+        return tmp
 
     def acquire(self, compactible, extra=None):
-        pass
+        transaction_id = self._get_next_transaction(compactible)
+        self._transactions[compactible, transaction_id] = list()
+        return TransactionToken(compactible, transaction_id)
 
-    def release(self, compactible):
-        pass
+    def add_callback(self, compactible, transaction_id, func):
+        if (compactible, transaction_id) not in self._transactions:
+            raise Exception
+        self._transactions[compactible, transaction_id].append(func)
+
+    def trigger(self, compactible, transaction_id, message):
+        for cb in self._transactions[compactible, transaction_id]:
+            cb(message)
+
+    def release(self, compactible, transaction_id):
+        del self._transactions[compactible, transaction_id]
+
+    def cleanup(self):
+        while sl[0].created_at + MAX_AGE < time.time():
+            rec = sl.pop(0)
+            del self._tokens[rec.key]
 
 
 class HashingTokenManager(object):
